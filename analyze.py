@@ -6,6 +6,7 @@ import configparser
 import html
 import ipaddress
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -640,14 +641,25 @@ def generate_cypher(r: AnalysisResult) -> str:
         all_ips.setdefault(src, ip_scope(src))
         all_ips.setdefault(dst, ip_scope(dst))
 
+    # Build IP -> nmap open-port list  (e.g. '22/tcp ssh — OpenSSH 8.9')
+    ip_open_ports: dict[str, list[str]] = defaultdict(list)
+    for dev in r.devices.values():
+        if dev.nmap_services:
+            for addr in dev.ips:
+                ip_open_ports[addr] = list(dev.nmap_services)
+
     # ── IP nodes (all, up-front) ──
     ln("// ── IP Addresses ──")
     for addr in sorted(all_ips):
         scope = all_ips[addr]
         esc_addr = _cypher_escape(addr)
         labels = _ip_labels(scope)
+        ports = ip_open_ports.get(addr, [])
+        ports_cypher = "[" + ", ".join(f"'{_cypher_escape(p)}'" for p in ports) + "]" if ports else "[]"
         ln(f"MERGE (ip{labels} {{address: '{esc_addr}'}})")
-        ln(f"  ON CREATE SET ip.source = 'pcap', ip.scope = '{scope}';")
+        ln(f"  ON CREATE SET ip.source = 'pcap', ip.scope = '{scope}',")
+        ln(f"    ip.open_ports = {ports_cypher}")
+        ln(f"  ON MATCH SET ip.open_ports = {ports_cypher};")
     ln("")
 
     # ── Devices ──
@@ -684,38 +696,6 @@ def generate_cypher(r: AnalysisResult) -> str:
             ln(f"MERGE (d)-[:HAS_IP]->(ip);")
             ln("")
 
-        # Nmap services → Port nodes
-        for svc in info.nmap_services:
-            # svc format: "22/tcp ssh" or "22/tcp ssh — OpenSSH 8.9"
-            try:
-                port_proto_part, *rest = svc.split(" ", 1)
-                port_num, proto = port_proto_part.split("/")
-                port_num = int(port_num)
-            except (ValueError, IndexError):
-                continue
-            svc_name = rest[0] if rest else ""
-            # Split off detail after " — "
-            if " \u2014 " in svc_name:
-                svc_name, svc_detail = svc_name.split(" \u2014 ", 1)
-            else:
-                svc_detail = ""
-            esc_svc_name = _cypher_escape(svc_name.strip())
-            esc_svc_detail = _cypher_escape(svc_detail.strip())
-            esc_proto = _cypher_escape(proto)
-
-            ln(f"MERGE (p:Port:Pcap {{number: {port_num}, protocol: '{esc_proto}'}})")
-            ln(f"  ON CREATE SET p.source = 'pcap', p.service = '{esc_svc_name}',")
-            ln(f"    p.detail = '{esc_svc_detail}'")
-            ln(f"  ON MATCH SET p.service = '{esc_svc_name}',")
-            ln(f"    p.detail = '{esc_svc_detail}';")
-            # Link each of the device's IPs to the port
-            for addr in sorted(info.ips):
-                esc_addr = _cypher_escape(addr)
-                ln(f"MATCH (ip:IPAddress {{address: '{esc_addr}'}})")
-                ln(f"MATCH (p:Port:Pcap {{number: {port_num}, protocol: '{esc_proto}'}})")
-                ln(f"MERGE (ip)-[:HAS_OPEN_PORT]->(p);")
-            ln("")
-
     # ── DNS queries ──
     ln("// ── DNS Queries ──")
     for src_ip, domains in r.dns_queries.items():
@@ -738,13 +718,16 @@ def generate_cypher(r: AnalysisResult) -> str:
         esc_src = _cypher_escape(src)
         esc_dst = _cypher_escape(dst)
         protos = _cypher_escape(", ".join(sorted(info.protocols))) if info.protocols else ""
+        # Extract port numbers from protocol labels like 'SSH (22)', 'HTTP (80)'
+        ports: list[int] = sorted({int(m.group(1)) for p in info.protocols for m in [re.search(r'\((\d+)\)', p)] if m})
+        ports_cypher = "[" + ", ".join(str(p) for p in ports) + "]" if ports else "[]"
         ln(f"MATCH (s:IPAddress {{address: '{esc_src}'}})")
         ln(f"MATCH (d:IPAddress {{address: '{esc_dst}'}})")
         ln(f"MERGE (s)-[c:COMMUNICATES_WITH]->(d)")
         ln(f"  ON CREATE SET c.packets = {info.packets}, c.bytes = {info.bytes},")
-        ln(f"    c.protocols = '{protos}'")
+        ln(f"    c.protocols = '{protos}', c.ports = {ports_cypher}")
         ln(f"  ON MATCH SET c.packets = {info.packets}, c.bytes = {info.bytes},")
-        ln(f"    c.protocols = '{protos}';")
+        ln(f"    c.protocols = '{protos}', c.ports = {ports_cypher};")
         ln("")
 
     # ── Cleartext warnings ──
