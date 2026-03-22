@@ -2,6 +2,7 @@
 """Analyze a pcap file and list all devices with the protocols they speak."""
 
 import argparse
+import configparser
 import html
 import ipaddress
 import os
@@ -572,6 +573,214 @@ def generate_html(r: AnalysisResult, output_path: str) -> None:
     print(f"  HTML report written to {output_path}")
 
 
+# ── Neo4j / Cypher output ────────────────────────────────────────
+
+DEFAULT_CONFIG_PATH = "verydisco.conf"
+
+
+def _read_neo4j_config(config_path: str) -> dict[str, str]:
+    """Read Neo4j connection settings from an INI config file."""
+    cfg = configparser.ConfigParser()
+    if not os.path.exists(config_path):
+        print(f"  [!] Config file not found: {config_path}")
+        print(f"      Copy verydisco.conf.example to verydisco.conf and edit it.")
+        sys.exit(1)
+    cfg.read(config_path)
+    if "neo4j" not in cfg:
+        print(f"  [!] Missing [neo4j] section in {config_path}")
+        sys.exit(1)
+    section = cfg["neo4j"]
+    return {
+        "uri": section.get("uri", "bolt://localhost:7687"),
+        "username": section.get("username", "neo4j"),
+        "password": section.get("password", "neo4j"),
+        "database": section.get("database", "neo4j"),
+    }
+
+
+def _cypher_escape(value: str) -> str:
+    """Escape a string value for use inside Cypher single-quoted literals."""
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
+def generate_cypher(r: AnalysisResult) -> str:
+    """Build Cypher MERGE statements from the analysis result.
+
+    Every node gets the :Pcap label and a `source: 'pcap'` property so it can
+    be selectively deleted without affecting nodes imported from other sources
+    (e.g. an asset list).
+    """
+    lines: list[str] = []
+    ln = lines.append
+
+    ln("// ── veryDisco Neo4j import ──")
+    ln(f"// Pcap: {r.pcap_path}  |  Packets: {r.total_packets}")
+    ln("// All nodes carry the :Pcap label for selective deletion.")
+    ln("")
+
+    # ── Devices ──
+    for key, info in r.devices.items():
+        is_mac = len(key) == 17 and key.count(":") == 5
+        esc_key = _cypher_escape(key)
+        vendor = _cypher_escape(info.vendor) if info.vendor else ""
+        os_guess = _cypher_escape(info.nmap_os or info.os_guess or "")
+        protos = _cypher_escape(", ".join(sorted(info.protocols)))
+
+        if is_mac:
+            ln(f"MERGE (d:Device:Pcap {{mac: '{esc_key}'}})")
+            ln(f"  ON CREATE SET d.source = 'pcap', d.vendor = '{vendor}',")
+            ln(f"    d.os_guess = '{os_guess}', d.protocols = '{protos}'")
+            ln(f"  ON MATCH SET d.vendor = '{vendor}',")
+            ln(f"    d.os_guess = '{os_guess}', d.protocols = '{protos}';")
+        else:
+            ln(f"MERGE (d:Device:Pcap {{device_key: '{esc_key}'}})")
+            ln(f"  ON CREATE SET d.source = 'pcap', d.os_guess = '{os_guess}',")
+            ln(f"    d.protocols = '{protos}'")
+            ln(f"  ON MATCH SET d.os_guess = '{os_guess}',")
+            ln(f"    d.protocols = '{protos}';")
+        ln("")
+
+        # IP addresses for this device
+        for addr in sorted(info.ips):
+            scope = ip_scope(addr)
+            esc_addr = _cypher_escape(addr)
+            ln(f"MERGE (ip:IPAddress:Pcap {{address: '{esc_addr}'}})")
+            ln(f"  ON CREATE SET ip.source = 'pcap', ip.scope = '{scope}';")
+            if is_mac:
+                ln(f"MATCH (d:Device:Pcap {{mac: '{esc_key}'}})")
+            else:
+                ln(f"MATCH (d:Device:Pcap {{device_key: '{esc_key}'}})")
+            ln(f"MATCH (ip:IPAddress:Pcap {{address: '{esc_addr}'}})")
+            ln(f"MERGE (d)-[:HAS_IP]->(ip);")
+            ln("")
+
+        # Nmap services
+        for svc in info.nmap_services:
+            esc_svc = _cypher_escape(svc)
+            if is_mac:
+                ln(f"MATCH (d:Device:Pcap {{mac: '{esc_key}'}})")
+            else:
+                ln(f"MATCH (d:Device:Pcap {{device_key: '{esc_key}'}})")
+            ln(f"SET d.nmap_services = coalesce(d.nmap_services, []) + ['{esc_svc}'];")
+            ln("")
+
+    # ── DNS queries ──
+    ln("// ── DNS Queries ──")
+    for src_ip, domains in r.dns_queries.items():
+        esc_src = _cypher_escape(src_ip)
+        unique = Counter(domains)
+        for domain, count in unique.most_common():
+            esc_domain = _cypher_escape(domain)
+            ln(f"MERGE (dom:Domain:Pcap {{name: '{esc_domain}'}})")
+            ln(f"  ON CREATE SET dom.source = 'pcap';")
+            ln(f"MATCH (ip:IPAddress:Pcap {{address: '{esc_src}'}})")
+            ln(f"MATCH (dom:Domain:Pcap {{name: '{esc_domain}'}})")
+            ln(f"MERGE (ip)-[q:QUERIES]->(dom)")
+            ln(f"  ON CREATE SET q.count = {count}")
+            ln(f"  ON MATCH SET q.count = {count};")
+            ln("")
+
+    # ── Conversations ──
+    ln("// ── Conversations ──")
+    for (src, dst), info in r.conversations.items():
+        esc_src = _cypher_escape(src)
+        esc_dst = _cypher_escape(dst)
+        scope_src = ip_scope(src)
+        scope_dst = ip_scope(dst)
+        protos = _cypher_escape(", ".join(sorted(info.protocols))) if info.protocols else ""
+        # Ensure both IP nodes exist
+        ln(f"MERGE (:IPAddress:Pcap {{address: '{esc_src}', source: 'pcap', scope: '{scope_src}'}});")
+        ln(f"MERGE (:IPAddress:Pcap {{address: '{esc_dst}', source: 'pcap', scope: '{scope_dst}'}});")
+        ln(f"MATCH (s:IPAddress:Pcap {{address: '{esc_src}'}})")
+        ln(f"MATCH (d:IPAddress:Pcap {{address: '{esc_dst}'}})")
+        ln(f"MERGE (s)-[c:COMMUNICATES_WITH]->(d)")
+        ln(f"  ON CREATE SET c.packets = {info.packets}, c.bytes = {info.bytes},")
+        ln(f"    c.protocols = '{protos}'")
+        ln(f"  ON MATCH SET c.packets = {info.packets}, c.bytes = {info.bytes},")
+        ln(f"    c.protocols = '{protos}';")
+        ln("")
+
+    # ── Cleartext warnings ──
+    if r.cleartext_warnings:
+        ln("// ── Cleartext Warnings ──")
+        seen: set[tuple] = set()
+        for w in r.cleartext_warnings:
+            ck = (w.src, w.dst, w.proto)
+            if ck in seen:
+                continue
+            seen.add(ck)
+            esc_src = _cypher_escape(w.src)
+            esc_dst = _cypher_escape(w.dst)
+            esc_proto = _cypher_escape(w.proto)
+            ln(f"MATCH (s:IPAddress:Pcap {{address: '{esc_src}'}})")
+            ln(f"MATCH (d:IPAddress:Pcap {{address: '{esc_dst}'}})")
+            ln(f"MERGE (s)-[cw:HAS_CLEARTEXT_WARNING {{proto: '{esc_proto}', port: {w.port}}}]->(d);")
+            ln("")
+
+    return "\n".join(lines)
+
+
+def write_neo4j(cypher: str, config_path: str) -> None:
+    """Connect to Neo4j and execute the Cypher statements."""
+    try:
+        from neo4j import GraphDatabase
+    except ImportError:
+        print("  [!] neo4j driver not installed. Run: pip install neo4j")
+        sys.exit(1)
+
+    conf = _read_neo4j_config(config_path)
+    print(f"  [neo4j] Connecting to {conf['uri']} (database: {conf['database']}) ...")
+
+    driver = GraphDatabase.driver(conf["uri"], auth=(conf["username"], conf["password"]))
+    try:
+        driver.verify_connectivity()
+    except Exception as e:
+        print(f"  [!] Neo4j connection failed: {e}")
+        sys.exit(1)
+
+    # Split on semicolons and run each statement
+    statements = [s.strip() for s in cypher.split(";") if s.strip() and not s.strip().startswith("//")]
+    print(f"  [neo4j] Executing {len(statements)} statement(s) ...")
+
+    with driver.session(database=conf["database"]) as session:
+        for stmt in statements:
+            # Skip comment-only blocks
+            real_lines = [l for l in stmt.splitlines() if not l.strip().startswith("//")]
+            if not any(l.strip() for l in real_lines):
+                continue
+            session.run(stmt)
+
+    driver.close()
+    print("  [neo4j] Import complete.")
+
+
+def clear_neo4j(config_path: str) -> None:
+    """Delete all :Pcap-labelled nodes and their relationships."""
+    try:
+        from neo4j import GraphDatabase
+    except ImportError:
+        print("  [!] neo4j driver not installed. Run: pip install neo4j")
+        sys.exit(1)
+
+    conf = _read_neo4j_config(config_path)
+    print(f"  [neo4j] Connecting to {conf['uri']} (database: {conf['database']}) ...")
+
+    driver = GraphDatabase.driver(conf["uri"], auth=(conf["username"], conf["password"]))
+    try:
+        driver.verify_connectivity()
+    except Exception as e:
+        print(f"  [!] Neo4j connection failed: {e}")
+        sys.exit(1)
+
+    with driver.session(database=conf["database"]) as session:
+        result = session.run("MATCH (n:Pcap) DETACH DELETE n RETURN count(n) AS deleted")
+        record = result.single()
+        count = record["deleted"] if record else 0
+
+    driver.close()
+    print(f"  [neo4j] Cleared {count} Pcap-labelled node(s).")
+
+
 # ── Main ─────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -581,7 +790,17 @@ def main() -> None:
     )
     parser.add_argument("pcap", nargs="?", default="capture.pcap", help="Path to pcap file")
     parser.add_argument("--nmap", action="store_true", help="Run active nmap scan (-O -sV) on discovered hosts (requires sudo)")
+    parser.add_argument("--neo4j", action="store_true", help="Generate a Cypher file for Neo4j import")
+    parser.add_argument("--neo4j-write", action="store_true", help="Write analysis results directly to Neo4j")
+    parser.add_argument("--neo4j-clear", action="store_true", help="Delete all Pcap-labelled nodes from Neo4j and exit")
+    parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to config file (default: verydisco.conf)")
     args = parser.parse_args()
+
+    # Handle --neo4j-clear early (no pcap needed)
+    if args.neo4j_clear:
+        clear_neo4j(args.config)
+        if not args.neo4j and not args.neo4j_write:
+            return
 
     result = extract(args.pcap)
 
@@ -592,6 +811,19 @@ def main() -> None:
 
     html_out = os.path.splitext(args.pcap)[0] + ".html"
     generate_html(result, html_out)
+
+    # Neo4j export
+    if args.neo4j or args.neo4j_write:
+        cypher = generate_cypher(result)
+
+        if args.neo4j:
+            cypher_out = os.path.splitext(args.pcap)[0] + ".cypher"
+            with open(cypher_out, "w") as f:
+                f.write(cypher)
+            print(f"  Cypher file written to {cypher_out}")
+
+        if args.neo4j_write:
+            write_neo4j(cypher, args.config)
 
 
 if __name__ == "__main__":
