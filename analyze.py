@@ -275,14 +275,14 @@ def extract(pcap_path: str) -> AnalysisResult:
 # ── Nmap active scanning ─────────────────────────────────────────
 
 def _scannable_ips(result: AnalysisResult) -> list[str]:
-    """Return deduplicated private/non-special IPs worth scanning."""
+    """Return deduplicated private (internal) IPs worth scanning."""
     seen: set[str] = set()
     for dev in result.devices.values():
         for addr in dev.ips:
             if addr in seen:
                 continue
             scope = ip_scope(addr)
-            if scope in ("private", "public"):
+            if scope == "private":
                 seen.add(addr)
     return sorted(seen)
 
