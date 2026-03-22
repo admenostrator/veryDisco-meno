@@ -603,12 +603,23 @@ def _cypher_escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace("'", "\\'")
 
 
+def _ip_labels(scope: str) -> str:
+    """Return Cypher label string for an IPAddress node based on scope.
+
+    Public IPs get an extra :External label so they can be easily identified
+    and styled differently in the graph.
+    """
+    if scope == "public":
+        return ":IPAddress:Pcap:External"
+    return ":IPAddress:Pcap"
+
+
 def generate_cypher(r: AnalysisResult) -> str:
     """Build Cypher MERGE statements from the analysis result.
 
     Every node gets the :Pcap label and a `source: 'pcap'` property so it can
     be selectively deleted without affecting nodes imported from other sources
-    (e.g. an asset list).
+    (e.g. an asset list).  Public IPs also get the :External label.
     """
     lines: list[str] = []
     ln = lines.append
@@ -616,9 +627,31 @@ def generate_cypher(r: AnalysisResult) -> str:
     ln("// ── veryDisco Neo4j import ──")
     ln(f"// Pcap: {r.pcap_path}  |  Packets: {r.total_packets}")
     ln("// All nodes carry the :Pcap label for selective deletion.")
+    ln("// Public IPs additionally carry the :External label.")
+    ln("")
+
+    # Collect every IP we'll ever reference so we can create them all
+    # up-front with consistent MERGE keys (address only).
+    all_ips: dict[str, str] = {}  # address -> scope
+    for dev in r.devices.values():
+        for addr in dev.ips:
+            all_ips[addr] = ip_scope(addr)
+    for (src, dst) in r.conversations:
+        all_ips.setdefault(src, ip_scope(src))
+        all_ips.setdefault(dst, ip_scope(dst))
+
+    # ── IP nodes (all, up-front) ──
+    ln("// ── IP Addresses ──")
+    for addr in sorted(all_ips):
+        scope = all_ips[addr]
+        esc_addr = _cypher_escape(addr)
+        labels = _ip_labels(scope)
+        ln(f"MERGE (ip{labels} {{address: '{esc_addr}'}})")
+        ln(f"  ON CREATE SET ip.source = 'pcap', ip.scope = '{scope}';")
     ln("")
 
     # ── Devices ──
+    ln("// ── Devices ──")
     for key, info in r.devices.items():
         is_mac = len(key) == 17 and key.count(":") == 5
         esc_key = _cypher_escape(key)
@@ -640,28 +673,47 @@ def generate_cypher(r: AnalysisResult) -> str:
             ln(f"    d.protocols = '{protos}';")
         ln("")
 
-        # IP addresses for this device
+        # Link device to its IPs
         for addr in sorted(info.ips):
-            scope = ip_scope(addr)
             esc_addr = _cypher_escape(addr)
-            ln(f"MERGE (ip:IPAddress:Pcap {{address: '{esc_addr}'}})")
-            ln(f"  ON CREATE SET ip.source = 'pcap', ip.scope = '{scope}';")
             if is_mac:
                 ln(f"MATCH (d:Device:Pcap {{mac: '{esc_key}'}})")
             else:
                 ln(f"MATCH (d:Device:Pcap {{device_key: '{esc_key}'}})")
-            ln(f"MATCH (ip:IPAddress:Pcap {{address: '{esc_addr}'}})")
+            ln(f"MATCH (ip:IPAddress {{address: '{esc_addr}'}})")
             ln(f"MERGE (d)-[:HAS_IP]->(ip);")
             ln("")
 
-        # Nmap services
+        # Nmap services → Port nodes
         for svc in info.nmap_services:
-            esc_svc = _cypher_escape(svc)
-            if is_mac:
-                ln(f"MATCH (d:Device:Pcap {{mac: '{esc_key}'}})")
+            # svc format: "22/tcp ssh" or "22/tcp ssh — OpenSSH 8.9"
+            try:
+                port_proto_part, *rest = svc.split(" ", 1)
+                port_num, proto = port_proto_part.split("/")
+                port_num = int(port_num)
+            except (ValueError, IndexError):
+                continue
+            svc_name = rest[0] if rest else ""
+            # Split off detail after " — "
+            if " \u2014 " in svc_name:
+                svc_name, svc_detail = svc_name.split(" \u2014 ", 1)
             else:
-                ln(f"MATCH (d:Device:Pcap {{device_key: '{esc_key}'}})")
-            ln(f"SET d.nmap_services = coalesce(d.nmap_services, []) + ['{esc_svc}'];")
+                svc_detail = ""
+            esc_svc_name = _cypher_escape(svc_name.strip())
+            esc_svc_detail = _cypher_escape(svc_detail.strip())
+            esc_proto = _cypher_escape(proto)
+
+            ln(f"MERGE (p:Port:Pcap {{number: {port_num}, protocol: '{esc_proto}'}})")
+            ln(f"  ON CREATE SET p.source = 'pcap', p.service = '{esc_svc_name}',")
+            ln(f"    p.detail = '{esc_svc_detail}'")
+            ln(f"  ON MATCH SET p.service = '{esc_svc_name}',")
+            ln(f"    p.detail = '{esc_svc_detail}';")
+            # Link each of the device's IPs to the port
+            for addr in sorted(info.ips):
+                esc_addr = _cypher_escape(addr)
+                ln(f"MATCH (ip:IPAddress {{address: '{esc_addr}'}})")
+                ln(f"MATCH (p:Port:Pcap {{number: {port_num}, protocol: '{esc_proto}'}})")
+                ln(f"MERGE (ip)-[:HAS_OPEN_PORT]->(p);")
             ln("")
 
     # ── DNS queries ──
@@ -673,7 +725,7 @@ def generate_cypher(r: AnalysisResult) -> str:
             esc_domain = _cypher_escape(domain)
             ln(f"MERGE (dom:Domain:Pcap {{name: '{esc_domain}'}})")
             ln(f"  ON CREATE SET dom.source = 'pcap';")
-            ln(f"MATCH (ip:IPAddress:Pcap {{address: '{esc_src}'}})")
+            ln(f"MATCH (ip:IPAddress {{address: '{esc_src}'}})")
             ln(f"MATCH (dom:Domain:Pcap {{name: '{esc_domain}'}})")
             ln(f"MERGE (ip)-[q:QUERIES]->(dom)")
             ln(f"  ON CREATE SET q.count = {count}")
@@ -685,14 +737,9 @@ def generate_cypher(r: AnalysisResult) -> str:
     for (src, dst), info in r.conversations.items():
         esc_src = _cypher_escape(src)
         esc_dst = _cypher_escape(dst)
-        scope_src = ip_scope(src)
-        scope_dst = ip_scope(dst)
         protos = _cypher_escape(", ".join(sorted(info.protocols))) if info.protocols else ""
-        # Ensure both IP nodes exist
-        ln(f"MERGE (:IPAddress:Pcap {{address: '{esc_src}', source: 'pcap', scope: '{scope_src}'}});")
-        ln(f"MERGE (:IPAddress:Pcap {{address: '{esc_dst}', source: 'pcap', scope: '{scope_dst}'}});")
-        ln(f"MATCH (s:IPAddress:Pcap {{address: '{esc_src}'}})")
-        ln(f"MATCH (d:IPAddress:Pcap {{address: '{esc_dst}'}})")
+        ln(f"MATCH (s:IPAddress {{address: '{esc_src}'}})")
+        ln(f"MATCH (d:IPAddress {{address: '{esc_dst}'}})")
         ln(f"MERGE (s)-[c:COMMUNICATES_WITH]->(d)")
         ln(f"  ON CREATE SET c.packets = {info.packets}, c.bytes = {info.bytes},")
         ln(f"    c.protocols = '{protos}'")
@@ -712,8 +759,8 @@ def generate_cypher(r: AnalysisResult) -> str:
             esc_src = _cypher_escape(w.src)
             esc_dst = _cypher_escape(w.dst)
             esc_proto = _cypher_escape(w.proto)
-            ln(f"MATCH (s:IPAddress:Pcap {{address: '{esc_src}'}})")
-            ln(f"MATCH (d:IPAddress:Pcap {{address: '{esc_dst}'}})")
+            ln(f"MATCH (s:IPAddress {{address: '{esc_src}'}})")
+            ln(f"MATCH (d:IPAddress {{address: '{esc_dst}'}})")
             ln(f"MERGE (s)-[cw:HAS_CLEARTEXT_WARNING {{proto: '{esc_proto}', port: {w.port}}}]->(d);")
             ln("")
 
